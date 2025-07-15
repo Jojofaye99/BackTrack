@@ -60,3 +60,7 @@ def calc_ema_of_ma(df: pd.DataFrame) -> pd.Series:
 # ✅ RSI(close, 14)
 def calc_rsi(df: pd.DataFrame, window=14) -> pd.Series:
     return ta.momentum.RSIIndicator(close=df['close'], window=window).rsi()
+
+def calc_macd_hist(df: pd.DataFrame) -> pd.Series:
+    macd = ta.trend.MACD(close=df['close'], window_slow=34, window_fast=13, window_sign=9)
+    return macd.macd_diff()

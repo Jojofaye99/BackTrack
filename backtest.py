@@ -1,192 +1,154 @@
-# ✅ 完整 backtest.py，满足你的所有规则说明：
-# - 开仓手续费计入 1% 资金上限；
-# - 平仓、持仓、强平手续费不计入保证金；
-# - 加入 balance_after 字段；
-# - 支持设置起始时间（如从 2024 年开始回测）；
-# - 输出净值曲线及统计数据。
-
 import os
 import math
 import pandas as pd
-from indicators import calc_ma10, calc_ema_of_ma, calc_rsi
 from strategy import simulate_trades
 from utils import analyze_results
 
-
-def load_and_prepare(filepath):
-    df = pd.read_csv(filepath)
-    df['datetime'] = pd.to_datetime(df['datetime'])
+def load_data(fp, start_date=None):
+    df = pd.read_csv(fp, parse_dates=['datetime'])
     df = df.sort_values('datetime').reset_index(drop=True)
-
-    df['MA10'] = calc_ma10(df)
-    df['EMA10'] = calc_ema_of_ma(df)
-    df['RSI'] = calc_rsi(df)
-
-    df.dropna(inplace=True)
+    if start_date:
+        df = df[df['datetime'] >= pd.to_datetime(start_date)]
     return df
 
-def run_backtest_for_period(name, filepath, start_date=None):
-    df = load_and_prepare(filepath)
+def run_backtest(name, fp, start_date=None, use_cross_margin=True):
+    df = load_data(fp, start_date)
+    trades = simulate_trades(df, use_cross_margin=use_cross_margin)
 
-    if start_date:
-        df = df[df['datetime'] >= pd.to_datetime(start_date)].reset_index(drop=True)
-
-    trades = simulate_trades(df)
-
-    results = []
-    initial_balance = 1500
+    initial_balance = 2000.0
     balance = initial_balance
+    open_amount = 40.0
     leverage = 100
-    open_percent = 0.005
+    fee_e = 0.006  # 开仓手续费（0.6%）
+    fee_x = 0.002  # 平仓手续费（0.2%）
+    fund_rate = 0.000005  # 每小时资金费率
     min_qty = 0.0001
-    liquidation_threshold = 0.01
 
-    entry_fee_rate = 0.0006
-    exit_fee_rate = 0.0006
-    liquidation_fee_rate = 0.0005
-    funding_rate_hourly = 0.000005
+    records = []
+    liq_count = 0
+    max_drawdown_duration = 0
+    drawdown_start_time = None
 
-    partial_count = 0
-    full_count = 0
+    win_trades, loss_trades = [], []
+    consecutive_losses = 0
+    max_consecutive_losses = 0
 
-    i = 0
-    while i < len(trades) - 1:
-        entry = trades[i]
-        exit_ = trades[i + 1]
+    for i in range(0, len(trades) - 1, 2):
+        e, x = trades[i], trades[i + 1]
 
-        entry_price = entry['price']
-        exit_price = exit_['price']
-        direction = entry['type']
-        entry_time = entry['time']
-        exit_time = exit_['time']
-        reason = exit_.get('reason', 'strategy')
-        duration_hours = (exit_time - entry_time).total_seconds() / 3600
-
-        capital = balance * open_percent
-        max_contract_value = (capital / (1 + entry_fee_rate)) * leverage
-        qty = math.floor((max_contract_value / entry_price) / min_qty) * min_qty
+        cap = open_amount
+        effective_cap = cap / (1 + fee_e)
+        qty = math.floor((effective_cap * leverage) / e['price'] / min_qty) * min_qty
         if qty < min_qty:
-            i += 2
             continue
 
-        notional = qty * entry_price
-        fee_entry = notional * entry_fee_rate
-        fee_exit = qty * exit_price * exit_fee_rate
-        fee_funding = notional * funding_rate_hourly * duration_hours
+        notional = qty * e['price']
+        fe = notional * fee_e
+        fx = qty * x['price'] * fee_x
+        dur = (x['time'] - e['time']).total_seconds() / 3600
+        ff = notional * fund_rate * dur
 
-        is_liquidated = False
-        if direction == 'long':
-            pnl = (exit_price - entry_price) * qty
-            if exit_price <= entry_price * (1 - liquidation_threshold):
-                is_liquidated = True
+        pnl = (x['price'] - e['price']) * qty if e['type'] == 'long' else (e['price'] - x['price']) * qty
+
+        liq_price = e['price'] * (1 - 1 / leverage) if e['type'] == 'long' else e['price'] * (1 + 1 / leverage)
+        is_liq = (e['type'] == 'long' and x['price'] <= liq_price) or (e['type'] == 'short' and x['price'] >= liq_price)
+        if is_liq and not use_cross_margin:
+            pnl = -cap
+            fx = qty * x['price'] * 0.005
+            x['reason'] = 'liquidation'
+            liq_count += 1
+
+        net = pnl - fx - ff
+        balance += net
+
+        if net > 0:
+            win_trades.append(net)
+            consecutive_losses = 0
         else:
-            pnl = (entry_price - exit_price) * qty
-            if exit_price >= entry_price * (1 + liquidation_threshold):
-                is_liquidated = True
+            loss_trades.append(abs(net))
+            consecutive_losses += 1
+            max_consecutive_losses = max(max_consecutive_losses, consecutive_losses)
 
-        if is_liquidated:
-            pnl = -capital
-            fee_exit = notional * liquidation_fee_rate
-            reason = "liquidation"
+        entry_time = pd.to_datetime(e['time'])
+        exit_time = pd.to_datetime(x['time'])
 
-        net_pnl = pnl - fee_exit - fee_funding
-
-        # ✅ 部分止盈
-        if 'partial' in reason:
-            net_pnl /= 2
-            partial_count += 1
-        else:
-            full_count += 1
-
-        balance += net_pnl
-
-        results.append({
-            "entry_time": entry_time,
-            "exit_time": exit_time,
-            "direction": direction,
-            "entry_price": entry_price,
-            "exit_price": exit_price,
-            "quantity": qty,
-            "contract_value": notional,
-            "fee_entry": fee_entry,
-            "fee_exit": fee_exit,
-            "total_fee": fee_entry + fee_exit,
-            "return": net_pnl,
-            "reason": reason,
-            "balance_after": balance
+        records.append({
+            'entry_type': e['type'],
+            'exit_reason': x['reason'],
+            'entry_price': e['price'],
+            'exit_price': x['price'],
+            'entry_time': entry_time,
+            'exit_time': exit_time,
+            'qty': qty,
+            'pnl': round(pnl, 4),
+            'net': round(net, 4),
+            'balance': round(balance, 4)
         })
 
-        i += 2
-
-    # === 结果处理 ===
-    result_df = pd.DataFrame(results)
-    trade_count = len(result_df)
-
-    if trade_count == 0:
-        print(f"⚠️ 无交易记录：{name}")
+    df_r = pd.DataFrame(records)
+    if df_r.empty:
+        print(f"⚠️ 无交易: {name}")
         return
 
-    # === 回测统计 ===
-    if 'return' in result_df.columns:
-        total_return = result_df['return'].sum()
-        avg_return = result_df['return'].mean()
-        win_rate = (result_df['return'] > 0).mean()
-    else:
-        # 使用 balance_after 差值近似
-        returns = result_df['balance_after'].diff().dropna()
-        total_return = returns.sum()
-        avg_return = returns.mean() if not returns.empty else 0
-        win_rate = (returns > 0).mean() if not returns.empty else 0
+    # 盈亏比
+    avg_win = sum(win_trades) / len(win_trades) if win_trades else 0
+    avg_loss = sum(loss_trades) / len(loss_trades) if loss_trades else 0
+    profit_factor = round(avg_win / avg_loss, 2) if avg_loss > 0 else float('inf')
 
-    equity_curve = result_df['balance_after']
-    drawdowns = equity_curve - equity_curve.cummax()
-    max_drawdown = drawdowns.min() if not drawdowns.empty else 0
+    # 净值回撤时间统计
+    eq = df_r['balance']
+    max_balance = eq[0]
+    drawdown_time = 0
+    current_duration = 0
+    for t, b in zip(df_r['exit_time'], eq):
+        if b >= max_balance:
+            max_balance = b
+            current_duration = 0
+        else:
+            current_duration += 1
+            drawdown_time = max(drawdown_time, current_duration)
 
-    liquidation_count = (result_df['reason'] == 'liquidation').sum()
-    liquidation_ratio = liquidation_count / trade_count if trade_count > 0 else 0
-
-    total_fees = result_df['fee_entry'].sum() + result_df['fee_exit'].sum()
+    total = df_r['net'].sum()
+    avg = df_r['net'].mean()
+    win = (df_r['net'] > 0).mean() * 100
+    dd = (df_r['balance'] - df_r['balance'].cummax()).min()
 
     stats = {
-        "总收益": round(total_return, 4),
-        "平均单笔收益": round(avg_return, 4),
-        "最大回撤": round(max_drawdown, 4),
-        "胜率": round(win_rate * 100, 2),
-        "交易次数": trade_count,
-        "爆仓次数": liquidation_count,
-        "爆仓占比": f"{round(liquidation_ratio * 100, 2)}%",
-        "部分止盈次数": partial_count,
-        "完全止盈次数": full_count,
-        "总进出场手续费": round(total_fees, 4)
+        '模式': '全仓（Cross）' if use_cross_margin else '逐仓（Isolated）',
+        '初始本金': initial_balance,
+        '交易次数': len(df_r),
+        '总收益': round(total, 4),
+        '平均盈亏': round(avg, 4),
+        '胜率': f"{win:.2f}%",
+        '最大回撤': round(dd, 4),
+        '最大连续亏损次数': max_consecutive_losses,
+        '最大回撤周期数': drawdown_time,
+        '盈亏比（Profit Factor）': profit_factor,
+        '爆仓次数': liq_count,
     }
 
-    # === 保存结果 ===
-    os.makedirs("backtest_results", exist_ok=True)
-    result_df.to_csv(f"backtest_results/{name}_results.csv", index=False)
+    os.makedirs('results', exist_ok=True)
+    df_r.to_csv(f"results/{name}_results.csv", index=False)
 
     try:
-        analyze_results(result_df, save_path=f"backtest_results/{name}_equity.png")
+        analyze_results(df_r, save_path=f"results/{name}_equity.png")
     except Exception as e:
-        print(f"⚠️ 净值图绘制失败：{e}")
+        print(f"⚠️ 净值图失败：{e}")
 
     print(f"\n✅ 完成回测：{name}")
     for k, v in stats.items():
         print(f"  {k}: {v}")
     print()
 
-
-def run_all(start_date='2024-07-01'):  # 2025-06-16
+def run_all(start_date='2024-07-01', use_cross_margin=True):
     periods = ['5m']
-    # periods = ['15m', '30m', '1H', '2H', '4H']
     for p in periods:
         filepath = f'data/BTC_USDT_SWAP_{p}_UTC.csv'
-        #filepath = f'data/BTC_USDT_SWAP_{p}.csv'
         name = f'btc_{p}'
         if os.path.exists(filepath):
-            run_backtest_for_period(name, filepath, start_date=start_date)
+            run_backtest(name, filepath, start_date=start_date, use_cross_margin=use_cross_margin)
         else:
             print(f"❌ 缺失数据文件：{filepath}")
 
-
 if __name__ == '__main__':
-    run_all()
+    run_all(start_date='2024-07-01', use_cross_margin=True)
