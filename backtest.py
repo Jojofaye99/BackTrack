@@ -1,8 +1,11 @@
 import os
-import math
 import pandas as pd
+from decimal import Decimal, getcontext, ROUND_DOWN
 from strategy import simulate_trades
 from utils import analyze_results
+
+# 设置全局 Decimal 精度
+getcontext().prec = 12
 
 def load_data(fp, start_date=None):
     df = pd.read_csv(fp, parse_dates=['datetime'])
@@ -17,18 +20,14 @@ def run_backtest(name, fp, start_date=None, use_cross_margin=True):
 
     initial_balance = 2000.0
     balance = initial_balance
-    open_amount = 40.0
+    open_amount = 200.0
     leverage = 100
-    fee_e = 0.006  # 开仓手续费（0.6%）
-    fee_x = 0.002  # 平仓手续费（0.2%）
-    fund_rate = 0.000005  # 每小时资金费率
-    min_qty = 0.0001
+    fee_e = 0.0006
+    fee_x = 0.0002
+    min_qty = Decimal('0.0001')  # 保证精度控制
 
     records = []
     liq_count = 0
-    max_drawdown_duration = 0
-    drawdown_start_time = None
-
     win_trades, loss_trades = [], []
     consecutive_losses = 0
     max_consecutive_losses = 0
@@ -36,36 +35,47 @@ def run_backtest(name, fp, start_date=None, use_cross_margin=True):
     for i in range(0, len(trades) - 1, 2):
         e, x = trades[i], trades[i + 1]
 
-        cap = open_amount
-        effective_cap = cap / (1 + fee_e)
-        qty = math.floor((effective_cap * leverage) / e['price'] / min_qty) * min_qty
+        cap = Decimal(open_amount)
+        effective_cap = cap / Decimal(1 + fee_e)
+        price_e = Decimal(str(e['price']))
+        raw_qty = (effective_cap * leverage) / price_e
+
+        # 向下取整为 min_qty 的整数倍
+        qty = (raw_qty // min_qty) * min_qty
+
         if qty < min_qty:
             continue
 
-        notional = qty * e['price']
-        fe = notional * fee_e
-        fx = qty * x['price'] * fee_x
-        dur = (x['time'] - e['time']).total_seconds() / 3600
-        ff = notional * fund_rate * dur
+        entry_notional = qty * price_e
+        fe = entry_notional * Decimal(fee_e)
 
-        pnl = (x['price'] - e['price']) * qty if e['type'] == 'long' else (e['price'] - x['price']) * qty
+        price_x = Decimal(str(x['price']))
+        exit_notional = qty * price_x
+        fx = exit_notional * Decimal(fee_x)
 
-        liq_price = e['price'] * (1 - 1 / leverage) if e['type'] == 'long' else e['price'] * (1 + 1 / leverage)
-        is_liq = (e['type'] == 'long' and x['price'] <= liq_price) or (e['type'] == 'short' and x['price'] >= liq_price)
+        if e['type'] == 'long':
+            pnl = (price_x - price_e) * qty
+            liq_price = price_e * (1 - Decimal(1 / leverage))
+            is_liq = price_x <= liq_price
+        else:
+            pnl = (price_e - price_x) * qty
+            liq_price = price_e * (1 + Decimal(1 / leverage))
+            is_liq = price_x >= liq_price
+
         if is_liq and not use_cross_margin:
             pnl = -cap
-            fx = qty * x['price'] * 0.005
+            fx = qty * price_x * Decimal('0.005')
             x['reason'] = 'liquidation'
             liq_count += 1
 
-        net = pnl - fx - ff
-        balance += net
+        net = pnl - fe - fx
+        balance += float(net)
 
         if net > 0:
-            win_trades.append(net)
+            win_trades.append(float(net))
             consecutive_losses = 0
         else:
-            loss_trades.append(abs(net))
+            loss_trades.append(abs(float(net)))
             consecutive_losses += 1
             max_consecutive_losses = max(max_consecutive_losses, consecutive_losses)
 
@@ -75,13 +85,13 @@ def run_backtest(name, fp, start_date=None, use_cross_margin=True):
         records.append({
             'entry_type': e['type'],
             'exit_reason': x['reason'],
-            'entry_price': e['price'],
-            'exit_price': x['price'],
+            'entry_price': float(price_e),
+            'exit_price': float(price_x),
             'entry_time': entry_time,
             'exit_time': exit_time,
-            'qty': qty,
-            'pnl': round(pnl, 4),
-            'net': round(net, 4),
+            'qty': float(qty),
+            'pnl': round(float(pnl), 4),
+            'net': round(float(net), 4),
             'balance': round(balance, 4)
         })
 
@@ -90,12 +100,10 @@ def run_backtest(name, fp, start_date=None, use_cross_margin=True):
         print(f"⚠️ 无交易: {name}")
         return
 
-    # 盈亏比
     avg_win = sum(win_trades) / len(win_trades) if win_trades else 0
     avg_loss = sum(loss_trades) / len(loss_trades) if loss_trades else 0
     profit_factor = round(avg_win / avg_loss, 2) if avg_loss > 0 else float('inf')
 
-    # 净值回撤时间统计
     eq = df_r['balance']
     max_balance = eq[0]
     drawdown_time = 0
@@ -140,8 +148,8 @@ def run_backtest(name, fp, start_date=None, use_cross_margin=True):
         print(f"  {k}: {v}")
     print()
 
-def run_all(start_date='2024-07-01', use_cross_margin=True):
-    periods = ['5m']
+def run_all(start_date='2024-05-31', use_cross_margin=True):
+    periods = ['15m']
     for p in periods:
         filepath = f'data/BTC_USDT_SWAP_{p}_UTC.csv'
         name = f'btc_{p}'
@@ -151,4 +159,4 @@ def run_all(start_date='2024-07-01', use_cross_margin=True):
             print(f"❌ 缺失数据文件：{filepath}")
 
 if __name__ == '__main__':
-    run_all(start_date='2024-07-01', use_cross_margin=True)
+    run_all(start_date='2024-05-31', use_cross_margin=True)
